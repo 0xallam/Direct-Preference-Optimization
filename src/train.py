@@ -29,36 +29,79 @@ def calculate_DPO_loss(model_prefered_logprob, model_disprefered_logprob,
     prefered_relative_logprob = model_prefered_logprob - ref_prefered_logprob
     disprefered_relative_logprob = model_disprefered_logprob - ref_disprefered_logprob
 
-    reward_accuracies = (prefered_relative_logprob > disprefered_relative_logprob).float().mean(dim=-1)
-    reward_margins = (prefered_relative_logprob - disprefered_relative_logprob).mean(dim=-1)
+    reward_accuracies = (prefered_relative_logprob > disprefered_relative_logprob).float().mean()
+    reward_margins = (prefered_relative_logprob - disprefered_relative_logprob).mean()
 
-    loss = -F.logsigmoid(beta * (prefered_relative_logprob - disprefered_relative_logprob)).mean(dim=-1)
+    loss = -F.logsigmoid(beta * (prefered_relative_logprob - disprefered_relative_logprob)).mean()
 
-    return loss, prefered_relative_logprob.mean(dim=-1), disprefered_relative_logprob.mean(dim=-1), reward_accuracies, reward_margins
+    return loss, prefered_relative_logprob.mean(), disprefered_relative_logprob.mean(), reward_accuracies, reward_margins
 
-def get_log_prob(logits, labels):
+def get_log_prob(logits, labels, prompt_lengths):
     log_probs = F.log_softmax(logits, dim=-1)
-    return torch.gather(log_probs, -1, labels.unsqueeze(-1)).squeeze(-1).mean(-1)
+    token_log_probs = torch.gather(log_probs, -1, labels.unsqueeze(-1)).squeeze(-1)
+    
+    batch_size, seq_len = labels.shape
+    response_mask = torch.arange(seq_len, device=labels.device).unsqueeze(0) >= prompt_lengths.unsqueeze(1)
+    response_mask = response_mask.float()
+    
+    response_log_probs = (token_log_probs * response_mask).sum(dim=-1)
+    response_lengths = response_mask.sum(dim=-1).clamp(min=1)
+    return response_log_probs / response_lengths
 
 def collate_fn(batch, tokenizer, max_length, device):
-    prompts = ['Instruct: ' + item['prompt'] + '\n' for item in batch]
-    chosen_responses = ['Output: ' + item['chosen'] for item in batch]
-    rejected_responses = ['Output: ' + item['rejected'] for item in batch]
+    prompt_encodings = tokenizer(
+        ['Instruct: ' + item['prompt'] + '\n' for item in batch],
+        padding='max_length',
+        truncation=True,
+        max_length=max_length,
+        return_tensors='pt'
+    )
+    
+    chosen_encodings = tokenizer(
+        ['Output: ' + item['chosen'] for item in batch],
+        padding='max_length',
+        truncation=True,
+        max_length=max_length,
+        return_tensors='pt'
+    )
+    
+    rejected_encodings = tokenizer(
+        ['Output: ' + item['rejected'] for item in batch],
+        padding='max_length',
+        truncation=True,
+        max_length=max_length,
+        return_tensors='pt'
+    )
 
-    prompt_ids = tokenizer.batch_encode_plus(prompts, padding=True, return_tensors="pt", max_length=max_length, truncation=True)['input_ids'].to(device)
-    prefered_ids = tokenizer.batch_encode_plus(chosen_responses, padding=True, return_tensors="pt", max_length=max_length, truncation=True)['input_ids'].to(device)
-    disprefered_ids = tokenizer.batch_encode_plus(rejected_responses, padding=True, return_tensors="pt", max_length=max_length, truncation=True)['input_ids'].to(device)
+    prompt_prefered_ids = torch.cat([
+        prompt_encodings.input_ids,
+        chosen_encodings.input_ids
+    ], dim=-1).to(device)
+    
+    prompt_disprefered_ids = torch.cat([
+        prompt_encodings.input_ids,
+        rejected_encodings.input_ids
+    ], dim=-1).to(device)
 
-    prompt_prefered_ids = torch.cat([prompt_ids, prefered_ids], dim=-1)
-    prompt_disprefered_ids = torch.cat([prompt_ids, disprefered_ids], dim=-1)
+    prompt_prefered_mask = torch.cat([
+        prompt_encodings.attention_mask,
+        chosen_encodings.attention_mask
+    ], dim=-1).to(device)
+    
+    prompt_disprefered_mask = torch.cat([
+        prompt_encodings.attention_mask,
+        rejected_encodings.attention_mask
+    ], dim=-1).to(device)
 
-    prompt_prefered_mask = torch.cat([torch.ones_like(prompt_ids), torch.zeros_like(prefered_ids)], dim=-1)
-    prompt_disprefered_mask = torch.cat([torch.ones_like(prompt_ids), torch.zeros_like(disprefered_ids)], dim=-1)
+    prompt_lengths = prompt_encodings.attention_mask.sum(dim=-1)
 
-    return {'prompt_prefered_ids': prompt_prefered_ids,
-            'prompt_disprefered_ids': prompt_disprefered_ids,
-            'prompt_prefered_mask': prompt_prefered_mask,
-            'prompt_disprefered_mask': prompt_disprefered_mask}
+    return {
+        'prompt_prefered_ids': prompt_prefered_ids,
+        'prompt_disprefered_ids': prompt_disprefered_ids,
+        'prompt_prefered_mask': prompt_prefered_mask,
+        'prompt_disprefered_mask': prompt_disprefered_mask,
+        'prompt_lengths': prompt_lengths
+    }
 
 def train(model, ref_model, tokenizer, optimizer, train_dataloader, epochs=1, beta=0.1):
     model.train()
@@ -68,29 +111,69 @@ def train(model, ref_model, tokenizer, optimizer, train_dataloader, epochs=1, be
         for batch in tqdm(train_dataloader):
             optimizer.zero_grad()
 
-            prompt_prefered_ids = batch['prompt_prefered_ids']
-            prompt_disprefered_ids = batch['prompt_disprefered_ids']
-            prompt_prefered_mask = batch['prompt_prefered_mask']
-            prompt_disprefered_mask = batch['prompt_disprefered_mask']
+            model_prefered_logits = model(
+                input_ids=batch['prompt_prefered_ids'],
+                attention_mask=batch['prompt_prefered_mask']
+            ).logits
+            
+            model_prefered_logprob = get_log_prob(
+                model_prefered_logits,
+                batch['prompt_prefered_ids'],
+                batch['prompt_lengths']
+            )
 
-            model_prefered_log_prob = get_log_prob(model(prompt_prefered_ids, attention_mask=prompt_prefered_mask).logits, prompt_prefered_ids)
-            model_disprefered_log_prob = get_log_prob(model(prompt_disprefered_ids, attention_mask=prompt_disprefered_mask).logits, prompt_disprefered_ids)
+            model_disprefered_logits = model(
+                input_ids=batch['prompt_disprefered_ids'],
+                attention_mask=batch['prompt_disprefered_mask']
+            ).logits
+            
+            model_disprefered_logprob = get_log_prob(
+                model_disprefered_logits,
+                batch['prompt_disprefered_ids'],
+                batch['prompt_lengths']
+            )
 
-            ref_prefered_log_prob = get_log_prob(ref_model(prompt_prefered_ids, attention_mask=prompt_prefered_mask).logits, prompt_prefered_ids)
-            ref_disprefered_log_prob = get_log_prob(ref_model(prompt_disprefered_ids, attention_mask=prompt_disprefered_mask).logits, prompt_disprefered_ids)
+            with torch.no_grad():
+                ref_prefered_logits = ref_model(
+                    input_ids=batch['prompt_prefered_ids'],
+                    attention_mask=batch['prompt_prefered_mask']
+                ).logits
+                
+                ref_prefered_logprob = get_log_prob(
+                    ref_prefered_logits,
+                    batch['prompt_prefered_ids'],
+                    batch['prompt_lengths']
+                )
 
-            loss, prefered_relative_logprob, disprefered_relative_logprob, reward_accuracies, reward_margins = calculate_DPO_loss(model_prefered_log_prob, model_disprefered_log_prob,
-                                          ref_prefered_log_prob, ref_disprefered_log_prob,
-                                          beta=beta)
+                ref_disprefered_logits = ref_model(
+                    input_ids=batch['prompt_disprefered_ids'],
+                    attention_mask=batch['prompt_disprefered_mask']
+                ).logits
+                
+                ref_disprefered_logprob = get_log_prob(
+                    ref_disprefered_logits,
+                    batch['prompt_disprefered_ids'],
+                    batch['prompt_lengths']
+                )
+
+            loss, prefered_relative_logprob, disprefered_relative_logprob, reward_accuracies, reward_margins = calculate_DPO_loss(
+                model_prefered_logprob,
+                model_disprefered_logprob,
+                ref_prefered_logprob,
+                ref_disprefered_logprob,
+                beta=beta
+            )
 
             loss.backward()
             optimizer.step()
 
-            wandb.log({'loss': loss.item(),
-                       'prefered_relative_logprob': prefered_relative_logprob,
-                       'disprefered_relative_logprob': disprefered_relative_logprob,
-                       'reward_accuracy': reward_accuracies,
-                       'reward_margin': reward_margins})
+            wandb.log({
+                'loss': loss.item(),
+                'prefered_relative_logprob': prefered_relative_logprob.item(),
+                'disprefered_relative_logprob': disprefered_relative_logprob.item(),
+                'reward_accuracy': reward_accuracies.item(),
+                'reward_margin': reward_margins.item()
+            })
 
 def main():
     parser = argparse.ArgumentParser()
@@ -119,10 +202,13 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
     ref_model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
 
+    ref_model.requires_grad_(False)
+
     optimizer = AdamW(model.parameters(), lr=args.lr)
 
     dataset = load_dataset(args.dataset_name, split="train")
-    train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=partial(collate_fn, tokenizer=tokenizer, max_length=args.max_length, device=device))
+    collate = partial(collate_fn, tokenizer=tokenizer, max_length=args.max_length, device=device)
+    train_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
 
     train(model, ref_model, tokenizer, optimizer, train_dataloader, epochs=args.epochs, beta=args.beta)
 
